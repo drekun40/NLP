@@ -1,0 +1,18 @@
+# Large data files — too big for GitHub
+f1_project/audio_files/
+f1_project/raw_f1_dataset.csv
+f1_project/processed_f1_dataset.csv
+f1_project/nohup.out
+f1_project/transcribe_log.txt
+f1_project/retry_log.txt
+
+# Model files
+*.pkl
+*.pt
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store

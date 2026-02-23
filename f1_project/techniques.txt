@@ -1,0 +1,33 @@
+F1 Radio NLP Project — Techniques Used
+=======================================
+
+1. DATA COLLECTION
+   - REST API calls (OpenF1): /team_radio, /laps, /drivers, /stints, /position, /intervals, /weather, /sessions
+   - Multi-endpoint joining — radio messages linked to lap context, tyre data, weather, position by timestamp
+   - Automated label generation: lap_delta = avg(next 3 laps) - avg(prev 3 laps) → UP / DOWN / NEUTRAL
+
+2. SPEECH-TO-TEXT (TRANSCRIPTION)
+   - OpenAI Whisper (base model) — local, offline transcription of .mp3 radio files
+   - Incremental saving — progress checkpointed every 50 rows to allow safe resume
+   - SSL bypass + retry logic with exponential backoff to handle rate limiting
+
+3. TEXT PREPROCESSING
+   - Lowercasing
+   - Lemmatization (spaCy) — e.g. "pushing" → "push", "tyres" → "tyre"
+   - Punctuation and number removal (spaCy tokenizer)
+   - Stopword removal (sklearn ENGLISH_STOP_WORDS)
+   - F1 filler word removal — custom list: "copy", "understood", "roger", "yeah", etc.
+   - F1 domain word preservation — kept: "drs", "pit", "vsc", "undercut", "safety car"
+   - Whisper artifact cleaning — removed [inaudible], [noise], collapsed repeated words (regex)
+
+4. FEATURE ENGINEERING
+   - VADER sentiment score — compound polarity of each radio message (-1 to +1)
+   - Transcript word count — message length as a feature
+   - Min-Max normalization — lap_duration, tyre_age, position, air_temperature, track_temperature, wind_speed scaled to [0, 1]
+   - Binary label (affected) — 1 if UP or DOWN, 0 if NEUTRAL (alongside 3-class label)
+
+5. DATASET
+   - Sources: OpenF1 Race + Qualifying sessions, 2023–2024 seasons
+   - Raw rows: 9,214
+   - Clean rows (with transcript + label): 3,949
+   - Class balance: NEUTRAL 1,638 / DOWN 1,246 / UP 1,065

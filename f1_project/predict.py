@@ -7,6 +7,7 @@ Usage:
     python3 predict.py "Copy that, understood"
 """
 import sys
+import os
 import pickle
 import re
 import warnings
@@ -52,16 +53,19 @@ def preprocess(text):
     return " ".join(tokens)
 
 # Load model
-with open("sentiment_model.pkl", "rb") as f:
+script_dir = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(script_dir, "sentiment_model.pkl")
+
+with open(model_path, "rb") as f:
     payload = pickle.load(f)
 
 model  = payload["lgb"]
 tfidf  = payload["tfidf"]
 num_cols = payload["num_cols"]
 
-LABEL_EMOJI = {"DOWN": "📉 DOWN (driver likely gets FASTER)", 
-               "UP":   "📈 UP   (driver likely gets SLOWER)",
-               "NEUTRAL": "➡️  NEUTRAL (no significant change)"}
+LABEL_EMOJI = {"DOWN": "Time will go DOWN (driver likely gets FASTER)", 
+               "UP":   "Time will go UP   (driver likely gets SLOWER)",
+               "NEUTRAL": "Time will go NEUTRAL (no significant change)"}
 
 def predict(radio_message: str):
     clean = preprocess(radio_message)
@@ -98,18 +102,25 @@ def predict(radio_message: str):
     pred = model.predict(X)[0]
     proba = model.predict_proba(X)[0]
     classes = model.classes_
+    
+    # Confidence Level Logic
+    max_prob = np.max(proba)
+    if max_prob > 0.8:
+        conf_text = "🟢 HIGH CONFIDENCE"
+    elif max_prob > 0.6:
+        conf_text = "🟡 MEDIUM CONFIDENCE"
+    else:
+        conf_text = "⚪ LOW CONFIDENCE (Ambiguous)"
 
-    print(f"\n{'='*55}")
-    print(f" Radio message : \"{radio_message}\"")
-    print(f" Clean tokens  : \"{clean}\"")
-    print(f" Sentiment     : {sentiment:+.3f}")
-    print(f"{'='*55}")
-    print(f" Prediction    : {LABEL_EMOJI[pred]}")
-    print(f"\n Probabilities:")
-    for cls, prob in sorted(zip(classes, proba), key=lambda x: -x[1]):
-        bar = "█" * int(prob * 30)
-        print(f"   {cls:<8} {bar:<30} {prob:.1%}")
-    print()
+    # Clearer F1-style labels
+    LABEL_MAP = {
+        "DOWN": "Pace will go UP",
+        "UP":   "Pace will go DOWN",
+        "NEUTRAL": "Pace is Stable"
+    }
+
+    print(f"\nRadio Message: \"{radio_message}\"")
+    print(f"Prediction:    {LABEL_MAP[pred]} ({max_prob:.1%} confidence)\n")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

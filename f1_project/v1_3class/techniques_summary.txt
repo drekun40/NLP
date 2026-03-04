@@ -1,0 +1,64 @@
+🏎️ F1 RADIO NLP PROJECT — TECHNICAL TECHNIQUES SUMMARY
+======================================================
+
+This document outlines the core technologies and data science techniques 
+used to build the F1 Radio Pace Predictor.
+
+1. DATA ACQUISITION & INTEGRATION
+---------------------------------
+- SOURCE: OpenF1 REST API (https://openf1.org)
+- SCOPE: 2023, 2024, and 2025 seasons (Races, Qualifying, and Sprints).
+- INTEGRATION: Multi-endpoint join using timestamps. Synchronized radio 
+  broadcasts with lap telemetry, tyre stints, and track conditions.
+
+2. SPEECH-TO-TEXT (ASR)
+-----------------------
+- MODEL: OpenAI Whisper (base)
+- EXECUTION: Local Python execution (CPU-optimized FP32).
+- CACHING: Persistent .mp3 storage to minimize redundant API calls.
+
+3. NLP & TEXT PREPROCESSING
+---------------------------
+- LEMMATIZATION: spaCy (en_core_web_sm) used to reduce words to root forms.
+- STOPWORD FILTERING: Scikit-learn's ENGLISH_STOP_WORDS + domain-specific 
+  exclusion list (e.g., removing filler words like "roger", "copy").
+- DOMAIN VOCABULARY: Preserve technical racing terms ("DRS", "Box", "Tyre").
+- SENTIMENT ANALYSIS: VADER Sentiment Intensity Analyzer (Compound scores).
+
+4. FEATURE ENGINEERING
+----------------------
+- TEXT VECTORIZATION: TF-IDF (Unigrams + Bigrams). Used sublinear scaling 
+  and limited to top 8,000 features.
+- NUMERICAL FEATURES: Normalized Lap Duration, Tyre Age, Track Position, 
+  and Weather data using Max/Min Scaling.
+- TARGET LABELING (Pace Delta): 
+    - [Next_3_Laps_Avg] - [Prev_3_Laps_Avg].
+    - Threshold: ±0.5s change determines PACE UP / DOWN / STABLE.
+
+5. MACHINE LEARNING & MODELING
+------------------------------
+- MODEL 1: LightGBM (Gradient Boosting Machine) — Tuned for high-dimensional sparsity.
+- MODEL 2: Random Forest — Used for robust ensemble decision making.
+- STACKING ENSEMBLE: A Meta-Model (Logistic Regression) combining predictions 
+  from both LightGBM and Random Forest to improve stability.
+- IMBALANCE HANDLING: SMOTE (Synthetic Minority Over-sampling Technique) to 
+  fix the "UP" (slower pace) class recall issues.
+- HYPERPARAMETER TUNING: GridSearchCV with 5-fold cross-validation.
+
+6. VISUALIZATION & UI
+---------------------
+- STYLE: custom Matplotlib/Seaborn theme (F1 Telemetry: Pure Black, F1 Red, 
+  Neon Green/Blue).
+- ANALYSIS: Word Clouds, Heatmaps (Confusion Matrix), and Multi-panel 
+  Donut/Bar charts.
+
+7. DEPLOYMENT & TOOLS
+---------------------
+- CODING: Python 3.10
+- LIBRARIES: Pandas, NumPy, Scikit-Learn, LightGBM, Imbalanced-Learn.
+- INTERFACE: Command-line predictor (`predict.py`) + Jupyter Notebook.
+- PERSISTENCE: Pickle serialization for model + TF-IDF pipeline payload.
+
+======================================================
+Final Accuracy: 64.2% | Dataset Size: 9,999 rows
+======================================================

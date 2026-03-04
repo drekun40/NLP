@@ -1,13 +1,14 @@
 """
-preprocess.py — improved preprocessing for F1 radio NLP model
+preprocess.py — F1 Radio NLP · Data Preprocessing Pipeline
 
-Improvements over basic version:
-1. Lemmatization — "pushing" → "push", "tyres" → "tyre"
-2. F1 filler word removal — removes radio noise words like "copy", "understood", "roger"
-3. VADER sentiment score — polarity of the message as a numerical feature
-4. Transcript noise cleaning — removes Whisper artifacts like "[inaudible]", repeated words
-5. Keeps F1-specific technical words — "drs", "vsc", "undercut", "pit", "safety car"
-6. Normalizes numerical features — position, tyre_age, lap_duration
+Steps:
+  1. Load raw_f1_dataset.csv
+  2. Clean transcripts  (Whisper artifacts, repeated words, punctuation)
+  3. Lemmatize with spaCy, removing stop-words & filler phrases
+  4. Compute VADER sentiment score
+  5. Derive binary label  UP/DOWN → AFFECTED (1),  NEUTRAL → STABLE (0)
+  6. Normalize numerical race features with MinMaxScaler
+  7. Save processed_f1_dataset.csv
 """
 import re
 import pandas as pd
@@ -17,116 +18,91 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from sklearn.preprocessing import MinMaxScaler
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-nlp = spacy.load("en_core_web_sm")
+nlp      = spacy.load("en_core_web_sm")
 analyzer = SentimentIntensityAnalyzer()
 
-# F1-specific filler words that add no predictive signal
-F1_FILLER_WORDS = {
+# Radio filler words that carry no predictive signal
+F1_FILLER = {
     "copy", "understood", "roger", "okay", "ok", "yeah", "yes", "yep",
     "no", "uh", "um", "er", "ah", "hmm", "right", "alright", "sure",
-    "hello", "hi", "bye", "thank", "thanks", "please", "sorry"
+    "hello", "hi", "bye", "thank", "thanks", "please", "sorry",
 }
 
-# F1 technical words — KEEP these even if they'd be filtered by stopwords
-F1_DOMAIN_WORDS = {
+# F1 technical terms — keep these even when they match generic stop-words
+F1_DOMAIN = {
     "drs", "vsc", "sc", "pit", "box", "tyre", "tire", "compound",
     "soft", "medium", "hard", "undercut", "overcut", "delta",
     "safety", "car", "strat", "strategy", "push", "gap", "interval",
     "lap", "sector", "overtake", "brake", "throttle", "downshift",
-    "upshift", "engine", "front", "rear", "wing", "fuel", "deg",
-    "degradation", "pace", "stint", "position", "radio", "team"
+    "upshift", "engine", "front", "rear", "wing", "fuel",
+    "degradation", "pace", "stint", "position", "radio", "team",
 }
 
-def clean_transcript(text):
-    """Remove Whisper artifacts and noise from transcription."""
-    # Remove brackets like [inaudible], [noise], [music]
-    text = re.sub(r"\[.*?\]", "", text)
-    # Remove excessive punctuation
-    text = re.sub(r"[^\w\s']", " ", text)
-    # Collapse repeated words (e.g. "push push push" → "push")
-    text = re.sub(r"\b(\w+)( \1\b)+", r"\1", text)
-    # Collapse extra whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
-def preprocess_text(text):
-    """Full preprocessing pipeline with lemmatization."""
-    text = clean_transcript(text)
-    text = text.lower()
-    doc = nlp(text)
+# ── Text helpers ──────────────────────────────────────────────────────────────
 
+def clean_transcript(text: str) -> str:
+    """Remove Whisper artifacts and normalise whitespace."""
+    text = re.sub(r"\[.*?\]", "", text)           # [inaudible], [noise] …
+    text = re.sub(r"[^\w\s']", " ", text)         # punctuation
+    text = re.sub(r"\b(\w+)( \1\b)+", r"\1", text)  # repeated words
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def preprocess_text(text: str) -> list[str]:
+    """Lemmatize and filter tokens."""
+    doc = nlp(clean_transcript(text).lower())
     tokens = []
-    for token in doc:
-        if token.is_punct or token.like_num or token.is_space:
+    for tok in doc:
+        if tok.is_punct or tok.like_num or tok.is_space:
             continue
-        lemma = token.lemma_.lower()
-        # Skip generic stop words UNLESS it's a domain-important word
-        if lemma in ENGLISH_STOP_WORDS and lemma not in F1_DOMAIN_WORDS:
+        lem = tok.lemma_.lower()
+        if lem in ENGLISH_STOP_WORDS and lem not in F1_DOMAIN:
             continue
-        # Remove F1 filler words
-        if lemma in F1_FILLER_WORDS:
+        if lem in F1_FILLER or len(lem) < 2:
             continue
-        # Skip very short tokens (1 char)
-        if len(lemma) < 2:
-            continue
-        tokens.append(lemma)
-
+        tokens.append(lem)
     return tokens
 
-# --- Load data ---
+
+# ── Load ──────────────────────────────────────────────────────────────────────
+
 df = pd.read_csv("raw_f1_dataset.csv")
 df = df[df["transcript"].notna() & df["label"].notna()].copy()
 df = df[df["transcript"].str.strip() != ""].copy()
-print(f"{len(df)} rows with transcript + label")
 
-# --- Text preprocessing ---
-df["tokens"] = df["transcript"].apply(preprocess_text)
-df["clean_text"] = df["tokens"].apply(lambda tokens: " ".join(tokens))
+# ── Preprocessing ─────────────────────────────────────────────────────────────
 
-# Drop rows where clean_text is empty after preprocessing (pure noise transcripts)
+df["clean_text"] = df["transcript"].apply(
+    lambda t: " ".join(preprocess_text(t))
+)
 df = df[df["clean_text"].str.strip() != ""].copy()
-print(f"{len(df)} rows after removing empty post-clean transcripts")
 
-# --- VADER sentiment score ---
-def get_sentiment(text):
-    scores = analyzer.polarity_scores(str(text))
-    return scores["compound"]  # -1 (very negative) to +1 (very positive)
+df["sentiment_score"]      = df["transcript"].apply(
+    lambda t: analyzer.polarity_scores(str(t))["compound"]
+)
+df["transcript_word_count"] = df["transcript"].apply(
+    lambda t: len(str(t).split())
+)
 
-df["sentiment_score"] = df["transcript"].apply(get_sentiment)
-
-# --- Transcript length as feature ---
-df["transcript_word_count"] = df["transcript"].apply(lambda t: len(str(t).split()))
-
-# --- Binary affected label ---
+# Binary label: pace changes (UP or DOWN) → 1, no change → 0
 df["affected"] = df["label"].apply(lambda x: 1 if x in ["UP", "DOWN"] else 0)
 
-# --- Normalize numerical features ---
-num_cols = ["lap_duration", "tyre_age", "position", "air_temperature",
-            "track_temperature", "wind_speed"]
-available_num_cols = [c for c in num_cols if c in df.columns]
+# ── Normalize numerical features ──────────────────────────────────────────────
 
-scaler = MinMaxScaler()
-df_num = df[available_num_cols].copy()
-df_num_filled = df_num.fillna(df_num.median())
-df[[f"{c}_norm" for c in available_num_cols]] = scaler.fit_transform(df_num_filled)
+NUM_COLS = ["lap_duration", "tyre_age", "position",
+            "air_temperature", "track_temperature", "wind_speed"]
+available = [c for c in NUM_COLS if c in df.columns]
 
-# --- Save ---
+scaler    = MinMaxScaler()
+filled    = df[available].fillna(df[available].median())
+df[[f"{c}_norm" for c in available]] = scaler.fit_transform(filled)
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+
 df.to_csv("processed_f1_dataset.csv", index=False)
-print(f"\nSaved processed_f1_dataset.csv — {len(df)} rows")
 
-print("\nSample transcripts:")
-print(df[["name_acronym", "transcript", "clean_text", "sentiment_score", "label"]].head(5).to_string())
-
-print("\n3-class label distribution:")
-print(df["label"].value_counts())
-
-print("\nBinary affected distribution:")
-print(df["affected"].value_counts())
-
-print("\nSentiment score stats:")
-print(df["sentiment_score"].describe().round(3))
-
-print(f"\nFeatures available for model:")
-feature_cols = ["clean_text", "sentiment_score", "transcript_word_count"] + \
-               [f"{c}_norm" for c in available_num_cols]
-print(feature_cols)
+print(f"Saved processed_f1_dataset.csv")
+print(f"  Rows    : {len(df):,}")
+print(f"  AFFECTED: {df['affected'].sum():,}  |  STABLE: {(df['affected']==0).sum():,}")
+print(f"  Columns : {len(df.columns)}")

@@ -1,139 +1,162 @@
 """
-predict.py — Use the trained F1 radio NLP model to make predictions.
+predict.py — F1 Radio NLP · Pace Predictor (Version 2 — Binary)
 
 Usage:
-    python3 predict.py "Box box, come in now, we're going to pit"
-    python3 predict.py "Push push push, gap is closing, push!"
-    python3 predict.py "Copy that, understood"
+    python3 predict.py "Box box, pit for fresh tyres"
+    python3 predict.py "Push harder!" --tyre-age 0.8 --position 0.4
+    python3 predict.py --interactive
 """
-import sys
-import os
-import pickle
-import re
-import warnings
+import os, sys, re, pickle, warnings, argparse
+import numpy as np
 import spacy
-warnings.filterwarnings("ignore", message="X does not have valid feature names")
+warnings.filterwarnings("ignore")
+
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from scipy.sparse import hstack, csr_matrix
-import numpy as np
 
-nlp = spacy.load("en_core_web_sm")
+nlp      = spacy.load("en_core_web_sm")
 analyzer = SentimentIntensityAnalyzer()
 
-F1_FILLER_WORDS = {
+F1_FILLER = {
     "copy", "understood", "roger", "okay", "ok", "yeah", "yes", "yep",
-    "no", "uh", "um", "er", "ah", "hmm", "right", "alright"
+    "no", "uh", "um", "er", "ah", "hmm", "right", "alright",
 }
-F1_DOMAIN_WORDS = {
+F1_DOMAIN = {
     "drs", "vsc", "sc", "pit", "box", "tyre", "tire", "compound",
     "soft", "medium", "hard", "undercut", "overcut", "delta", "safety",
-    "car", "strat", "strategy", "push", "gap", "interval", "lap", "sector"
+    "car", "strat", "strategy", "push", "gap", "interval", "lap", "sector",
 }
 
-def clean_text(text):
+
+# ── Text preprocessing ────────────────────────────────────────────────────────
+
+def _clean(text: str) -> str:
     text = re.sub(r"\[.*?\]", "", text)
     text = re.sub(r"[^\w\s']", " ", text)
     text = re.sub(r"\b(\w+)( \1\b)+", r"\1", text)
     return re.sub(r"\s+", " ", text).strip()
 
-def preprocess(text):
-    text = clean_text(text).lower()
-    doc = nlp(text)
+
+def preprocess(text: str) -> str:
+    doc = nlp(_clean(text).lower())
     tokens = []
-    for token in doc:
-        if token.is_punct or token.like_num or token.is_space:
+    for tok in doc:
+        if tok.is_punct or tok.like_num or tok.is_space:
             continue
-        lemma = token.lemma_.lower()
-        if lemma in ENGLISH_STOP_WORDS and lemma not in F1_DOMAIN_WORDS:
+        lem = tok.lemma_.lower()
+        if lem in ENGLISH_STOP_WORDS and lem not in F1_DOMAIN:
             continue
-        if lemma in F1_FILLER_WORDS or len(lemma) < 2:
+        if lem in F1_FILLER or len(lem) < 2:
             continue
-        tokens.append(lemma)
+        tokens.append(lem)
     return " ".join(tokens)
 
-# Load model
-script_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(script_dir, "sentiment_model.pkl")
 
-with open(model_path, "rb") as f:
-    payload = pickle.load(f)
+# ── Load model ────────────────────────────────────────────────────────────────
 
-model  = payload["lgb"]
-tfidf  = payload["tfidf"]
-num_cols = payload["num_cols"]
+_dir      = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(_dir, "sentiment_model.pkl"), "rb") as f:
+    _payload = pickle.load(f)
 
-LABEL_EMOJI = {"DOWN": "Time will go DOWN (driver likely gets FASTER)", 
-               "UP":   "Time will go UP   (driver likely gets SLOWER)",
-               "NEUTRAL": "Time will go NEUTRAL (no significant change)"}
+_model     = _payload["lgb"]
+_tfidf     = _payload["tfidf"]
+_num_cols  = _payload["num_cols"]
+_threshold = _payload.get("threshold", 0.54)
 
-def predict(radio_message: str):
-    clean = preprocess(radio_message)
-    sentiment = analyzer.polarity_scores(radio_message)["compound"]
-    word_count = len(radio_message.split())
 
-    X_text = tfidf.transform([clean])
+# ── Prediction ────────────────────────────────────────────────────────────────
 
-    # Build numerical features (zeros for missing race context)
-    num_values = []
-    defaults = {
-        "sentiment_score": sentiment,
-        "transcript_word_count": word_count,
-        "lap_duration_norm": 0.5,
-        "tyre_age_norm": 0.5,
-        "position_norm": 0.5,
-        "air_temperature_norm": 0.5,
+def predict(message: str, context: dict = None) -> tuple[int, float]:
+    """
+    Predict whether a team radio message will affect driver pace.
+
+    Parameters
+    ----------
+    message : str
+        Raw team radio transcript.
+    context : dict, optional
+        Race metadata (all values normalised 0–1):
+          tyre_age_norm         — 0=new tyres, 1=heavily worn
+          position_norm         — 0=P1, 1=P20
+          driver_affected_rate  — driver's historical pace-change rate
+
+    Returns
+    -------
+    (prediction, probability)
+        prediction : int   — 1=AFFECTED, 0=STABLE
+        probability: float — P(AFFECTED)
+    """
+    sentiment  = analyzer.polarity_scores(message)["compound"]
+    word_count = len(message.split())
+
+    features = {
+        "sentiment_score":        sentiment,
+        "transcript_word_count":  word_count,
+        "lap_duration_norm":      0.5,
+        "tyre_age_norm":          0.5,
+        "position_norm":          0.5,
+        "air_temperature_norm":   0.5,
         "track_temperature_norm": 0.5,
-        "wind_speed_norm": 0.3,
-        "driver_down_rate": 0.4,
-        "circuit_avg_delta": 0.0,
-        "tyre_sentiment": 0.5 * sentiment,
-        "msg_short": int(word_count < 5),
-        "msg_long": int(word_count > 15),
-        "negative_msg": int(sentiment < -0.2),
-        "positive_msg": int(sentiment > 0.3),
+        "wind_speed_norm":        0.3,
+        "driver_affected_rate":   0.5,
+        "circuit_volatility":     0.0,
+        "tyre_sentiment":         0.5 * sentiment,
+        "msg_short":              int(word_count < 5),
+        "msg_long":               int(word_count > 15),
+        "negative_msg":           int(sentiment < -0.2),
+        "positive_msg":           int(sentiment > 0.3),
     }
-    for col in num_cols:
-        num_values.append(defaults.get(col, 0.0))
+    if context:
+        features.update(context)
+        features["tyre_sentiment"] = features["tyre_age_norm"] * sentiment
 
-    X_num = csr_matrix([num_values])
-    X = hstack([X_text, X_num])
+    X_text  = _tfidf.transform([preprocess(message)])
+    X_num   = csr_matrix([[features.get(c, 0.0) for c in _num_cols]])
+    p       = float(_model.predict_proba(hstack([X_text, X_num]))[0, 1])
+    pred    = 1 if p >= _threshold else 0
+    conf    = p if pred == 1 else 1.0 - p
+    label   = "AFFECTED" if pred == 1 else "STABLE"
+    ctx_tag = " (with context)" if context else ""
 
-    pred = model.predict(X)[0]
-    proba = model.predict_proba(X)[0]
-    classes = model.classes_
-    
-    # Confidence Level Logic
-    max_prob = np.max(proba)
-    if max_prob > 0.8:
-        conf_text = "🟢 HIGH CONFIDENCE"
-    elif max_prob > 0.6:
-        conf_text = "🟡 MEDIUM CONFIDENCE"
-    else:
-        conf_text = "⚪ LOW CONFIDENCE (Ambiguous)"
+    print(f'  "{message}"')
+    print(f"  → {label}  ({conf:.1%} confidence{ctx_tag})\n")
+    return pred, p
 
-    # Clearer F1-style labels
-    LABEL_MAP = {
-        "DOWN": "Pace will go UP",
-        "UP":   "Pace will go DOWN",
-        "NEUTRAL": "Pace is Stable"
-    }
 
-    print(f"\nRadio Message: \"{radio_message}\"")
-    print(f"Prediction:    {LABEL_MAP[pred]} ({max_prob:.1%} confidence)\n")
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        message = " ".join(sys.argv[1:])
-        predict(message)
+    parser = argparse.ArgumentParser(
+        description="F1 Radio NLP — Pace Predictor v2",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("message", nargs="*", help="Radio message text")
+    parser.add_argument("--tyre-age",    type=float, metavar="0-1",
+                        help="Tyre wear (0=new, 1=worn)")
+    parser.add_argument("--position",    type=float, metavar="0-1",
+                        help="Track position (0=P1, 1=P20)")
+    parser.add_argument("--driver-rate", type=float, metavar="0-1",
+                        help="Driver historical affected rate")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Enter message and context interactively")
+    args = parser.parse_args()
+
+    ctx = {}
+    if args.tyre_age    is not None: ctx["tyre_age_norm"]       = args.tyre_age
+    if args.position    is not None: ctx["position_norm"]        = args.position
+    if args.driver_rate is not None: ctx["driver_affected_rate"] = args.driver_rate
+
+    print(f"\nF1 Pace Predictor  [threshold={_threshold:.2f}]\n")
+
+    if args.interactive:
+        msg = input("Radio message : ").strip()
+        ta  = input("Tyre age 0–1  [↵ skip]: ").strip()
+        pos = input("Position 0–1  [↵ skip]: ").strip()
+        if ta:  ctx["tyre_age_norm"]  = float(ta)
+        if pos: ctx["position_norm"]  = float(pos)
+        predict(msg, ctx or None)
+    elif args.message:
+        predict(" ".join(args.message), ctx or None)
     else:
-        # Demo with a few examples
-        examples = [
-            "Box box, come in now, put the soft tyres on",
-            "Push push push! Gap is only 1.2, we need to attack!",
-            "Copy that, understood, we'll check the data",
-            "Something is wrong with the engine, I have no power",
-            "Valtteri, it's James. We need you to hold position behind Lewis.",
-        ]
-        for msg in examples:
-            predict(msg)
+        parser.print_help()

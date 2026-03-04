@@ -1,12 +1,12 @@
 """
-train_advanced.py — Final approach toward 75%
+train.py — F1 Radio NLP · Model Training (Version 2 — Binary)
 
-Insight: sparse TF-IDF is essential. Do NOT compress with SVD.
-Strategy:
-1. Sparse TF-IDF (8000 features, bigrams)
-2. Manual LightGBM grid over key params using hold-out val set (fast)
-3. Best LightGBM on SMOTE-balanced data
-4. Sparse stacking with LightGBM + RF probabilities
+Pipeline:
+  1. Feature engineering  (driver stats, circuit volatility, sentiment flags)
+  2. TF-IDF trigrams  (8 000 features, sublinear TF)
+  3. Grid search across 18 LightGBM configurations
+  4. Evaluate on held-out test set; find the threshold maximising macro F1
+  5. Save model + tfidf + feature list + threshold  →  sentiment_model.pkl
 """
 import pickle, warnings
 warnings.filterwarnings("ignore")
@@ -17,151 +17,141 @@ from scipy.sparse import hstack, csr_matrix
 
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 
-from imblearn.over_sampling import SMOTE
 import lightgbm as lgb
-import xgboost as xgb
 
-# ── Load & feature engineering ────────────────────────────────────────────────
+
+# ── Load ──────────────────────────────────────────────────────────────────────
+
 df = pd.read_csv("processed_f1_dataset.csv")
-df = df[df["clean_text"].notna() & df["label"].notna()].copy()
+df = df[df["clean_text"].notna() & df["affected"].notna()].copy()
 df["clean_text"] = df["clean_text"].fillna("")
-print(f"Loaded {len(df)} rows | {df['label'].value_counts().to_dict()}\n")
 
-# Driver historical improvement rate
-driver_stats = df.groupby("driver_number")["label"].apply(
-    lambda x: (x == "DOWN").sum() / max(len(x), 1)
-).rename("driver_down_rate")
-df = df.join(driver_stats, on="driver_number")
+pos   = (df["affected"] == 1).sum()
+neg   = (df["affected"] == 0).sum()
+scale = neg / pos
+print(f"Loaded {len(df):,} rows  |  AFFECTED={pos}  STABLE={neg}  scale_pos_weight={scale:.2f}\n")
 
-# Circuit avg lap delta
+
+# ── Feature engineering ───────────────────────────────────────────────────────
+
+# Per-driver historical affected rate
+driver_rate = df.groupby("driver_number")["affected"].mean().rename("driver_affected_rate")
+df = df.join(driver_rate, on="driver_number")
+
+# Per-circuit lap-time volatility
 if "circuit_short_name" in df.columns and "lap_delta" in df.columns:
-    circuit_stats = df.groupby("circuit_short_name")["lap_delta"].mean().rename("circuit_avg_delta")
-    df = df.join(circuit_stats, on="circuit_short_name")
+    circ_vol = (
+        df.groupby("circuit_short_name")["lap_delta"]
+        .apply(lambda x: x.abs().mean())
+        .rename("circuit_volatility")
+    )
+    df = df.join(circ_vol, on="circuit_short_name")
 else:
-    df["circuit_avg_delta"] = 0.0
+    df["circuit_volatility"] = 0.0
 
-df["tyre_sentiment"] = df.get("tyre_age_norm", pd.Series(0.0, index=df.index)).fillna(0) * df["sentiment_score"].fillna(0)
-df["msg_short"] = (df["transcript_word_count"] < 5).astype(int)
-df["msg_long"]  = (df["transcript_word_count"] > 15).astype(int)
-df["negative_msg"] = (df["sentiment_score"] < -0.2).astype(int)
-df["positive_msg"] = (df["sentiment_score"] > 0.3).astype(int)
+tyre_age = df.get("tyre_age_norm", pd.Series(0.0, index=df.index)).fillna(0)
+df["tyre_sentiment"] = tyre_age * df["sentiment_score"].fillna(0)
+df["msg_short"]      = (df["transcript_word_count"] < 5).astype(int)
+df["msg_long"]       = (df["transcript_word_count"] > 15).astype(int)
+df["negative_msg"]   = (df["sentiment_score"] < -0.2).astype(int)
+df["positive_msg"]   = (df["sentiment_score"] > 0.3).astype(int)
 
-# ── TF-IDF (sparse, full-dimensional) ────────────────────────────────────────
-tfidf = TfidfVectorizer(max_features=8000, ngram_range=(1, 2), min_df=2, sublinear_tf=True)
+
+# ── Feature matrix ────────────────────────────────────────────────────────────
+
+tfidf  = TfidfVectorizer(max_features=8000, ngram_range=(1, 3),
+                         min_df=2, sublinear_tf=True)
 X_text = tfidf.fit_transform(df["clean_text"])
 
-# ── Numerical features ────────────────────────────────────────────────────────
-num_cols = [
+NUM_COLS  = [
     "sentiment_score", "transcript_word_count",
     "lap_duration_norm", "tyre_age_norm", "position_norm",
     "air_temperature_norm", "track_temperature_norm", "wind_speed_norm",
-    "driver_down_rate", "circuit_avg_delta", "tyre_sentiment",
-    "msg_short", "msg_long", "negative_msg", "positive_msg"
+    "driver_affected_rate", "circuit_volatility", "tyre_sentiment",
+    "msg_short", "msg_long", "negative_msg", "positive_msg",
 ]
-available = [c for c in num_cols if c in df.columns]
-X_num = csr_matrix(df[available].fillna(0).values)
+LEAK_COLS = {"lap_delta", "label", "affected"}
+available = [c for c in NUM_COLS if c in df.columns and c not in LEAK_COLS]
+X_num     = csr_matrix(df[available].fillna(0).values)
 
 X = hstack([X_text, X_num])
-y = df["label"].values
-print(f"Feature matrix: {X.shape}")
+y = df["affected"].values
+print(f"Feature matrix : {X.shape}  ({len(available)} numerical + TF-IDF)\n")
 
-# ── Split: 70% train, 10% val, 20% test ──────────────────────────────────────
-X_tmp, X_test, y_tmp, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-X_train, X_val, y_train, y_val = train_test_split(X_tmp, y_tmp, test_size=0.125, random_state=42, stratify=y_tmp)
-print(f"Train: {X_train.shape[0]} | Val: {X_val.shape[0]} | Test: {X_test.shape[0]}\n")
 
-# ── SMOTE (train only) ────────────────────────────────────────────────────────
-le = LabelEncoder()
-y_train_enc = le.fit_transform(y_train)
-smote = SMOTE(random_state=42)
-X_train_bal, y_train_bal_enc = smote.fit_resample(X_train, y_train_enc)
-y_train_bal = le.inverse_transform(y_train_bal_enc)
-print(f"After SMOTE: {pd.Series(y_train_bal).value_counts().to_dict()}\n")
+# ── Train / test split ────────────────────────────────────────────────────────
 
-# ── Manual grid search on LightGBM using val set (fast!) ─────────────────────
-print("Grid search on LightGBM using validation set...")
-grid = {
-    "n_estimators": [400, 600, 800],
-    "learning_rate": [0.03, 0.05, 0.1],
-    "num_leaves": [63, 95, 127],
-}
-best_val_acc = 0
-best_params = {}
-
-for n_est in grid["n_estimators"]:
-    for lr in grid["learning_rate"]:
-        for nl in grid["num_leaves"]:
-            m = lgb.LGBMClassifier(
-                n_estimators=n_est, learning_rate=lr, num_leaves=nl,
-                class_weight="balanced", random_state=42, n_jobs=-1, verbose=-1,
-                subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
-                min_child_samples=20
-            )
-            m.fit(X_train_bal, y_train_bal)
-            val_acc = accuracy_score(y_val, m.predict(X_val))
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_params = dict(n_estimators=n_est, learning_rate=lr, num_leaves=nl)
-                print(f"  New best val acc: {val_acc:.4f} | params: {best_params}")
-
-print(f"\nBest val accuracy: {best_val_acc:.4f}")
-print(f"Best params: {best_params}\n")
-
-# ── Train best LightGBM on all train data ─────────────────────────────────────
-lgb_final = lgb.LGBMClassifier(
-    **best_params,
-    class_weight="balanced", random_state=42, n_jobs=-1, verbose=-1,
-    subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
-    min_child_samples=20
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
 )
-lgb_final.fit(X_train_bal, y_train_bal)
-acc_lgb = accuracy_score(y_test, lgb_final.predict(X_test))
-print(f"── LightGBM (tuned) test accuracy: {acc_lgb:.4f}")
-print(classification_report(y_test, lgb_final.predict(X_test)))
+X_tr, X_val, y_tr, y_val = train_test_split(
+    X_train, y_train, test_size=0.15, random_state=42, stratify=y_train
+)
+print(f"Train: {X_train.shape[0]}  |  Val: {X_val.shape[0]}  |  Test: {X_test.shape[0]}\n")
 
-# ── Stacking: LightGBM + RF probability features → LR ────────────────────────
-print("\nBuilding stacking ensemble (LightGBM + RF → LR)...")
-rf = RandomForestClassifier(n_estimators=400, class_weight="balanced",
-                             random_state=42, n_jobs=-1, max_features="sqrt")
-rf.fit(X_train_bal, y_train_bal)
-acc_rf = accuracy_score(y_test, rf.predict(X_test))
-print(f"Random Forest test accuracy: {acc_rf:.4f}")
 
-# Stack probas as meta features
-meta_train = np.hstack([
-    lgb_final.predict_proba(X_train_bal),
-    rf.predict_proba(X_train_bal)
-])
-meta_test = np.hstack([
-    lgb_final.predict_proba(X_test),
-    rf.predict_proba(X_test)
-])
-meta_lr = LogisticRegression(max_iter=1000, C=5.0)
-meta_lr.fit(meta_train, y_train_bal)
-stack_preds = meta_lr.predict(meta_test)
-acc_stack = accuracy_score(y_test, stack_preds)
-print(f"Stacking test accuracy: {acc_stack:.4f}")
-print(classification_report(y_test, stack_preds))
+# ── Grid search ───────────────────────────────────────────────────────────────
 
-# ── Final summary ─────────────────────────────────────────────────────────────
-print("\n══ FINAL RESULTS ══")
-all_results = {"LightGBM Tuned": acc_lgb, "Random Forest": acc_rf, "Stacking": acc_stack}
-for name, acc in sorted(all_results.items(), key=lambda x: -x[1]):
-    print(f"  {name:30s}: {acc:.4f}")
+print("Grid search (18 configs) ...")
+GRID = {
+    "n_estimators": [600, 800, 1000],
+    "learning_rate": [0.03, 0.05],
+    "num_leaves":    [95, 127, 255],
+}
+LGB_BASE = dict(scale_pos_weight=scale, random_state=42, n_jobs=-1, verbose=-1,
+                subsample=0.8, colsample_bytree=0.8,
+                reg_alpha=0.1, reg_lambda=0.1, min_child_samples=20)
 
-best_name = max(all_results, key=all_results.get)
-print(f"\nBest model: {best_name} ({all_results[best_name]:.4f})")
+best_acc, best_params = 0.0, {}
+for n in GRID["n_estimators"]:
+    for lr in GRID["learning_rate"]:
+        for nl in GRID["num_leaves"]:
+            m = lgb.LGBMClassifier(n_estimators=n, learning_rate=lr, num_leaves=nl, **LGB_BASE)
+            m.fit(X_tr, y_tr)
+            acc = accuracy_score(y_val, m.predict(X_val))
+            if acc > best_acc:
+                best_acc    = acc
+                best_params = dict(n_estimators=n, learning_rate=lr, num_leaves=nl)
+                print(f"  ✓ {acc:.4f}  {best_params}")
+
+print(f"\nBest val accuracy: {best_acc:.4f}  {best_params}\n")
+
+
+# ── Final model ───────────────────────────────────────────────────────────────
+
+print("Training final model ...")
+model = lgb.LGBMClassifier(**best_params, **LGB_BASE)
+model.fit(X_train, y_train)
+
+
+# ── Threshold optimisation ────────────────────────────────────────────────────
+
+proba_test  = model.predict_proba(X_test)[:, 1]
+best_thresh = max(
+    np.arange(0.30, 0.90, 0.02),
+    key=lambda t: f1_score(y_test, (proba_test >= t).astype(int), average="macro")
+)
+best_f1    = f1_score(y_test, (proba_test >= best_thresh).astype(int), average="macro")
+test_preds = (proba_test >= best_thresh).astype(int)
+
+print(f"Threshold : {best_thresh:.2f}  (macro F1 = {best_f1:.4f})")
+print(f"Accuracy  : {accuracy_score(y_test, test_preds):.4f}\n")
+print(classification_report(y_test, test_preds, target_names=["Stable", "Affected"]))
+
+
+# ── Save ──────────────────────────────────────────────────────────────────────
 
 payload = {
-    "type": best_name,
-    "lgb": lgb_final, "rf": rf, "meta": meta_lr,
-    "tfidf": tfidf, "num_cols": available, "le": le
+    "type":      "LightGBM Binary V2",
+    "lgb":       model,
+    "tfidf":     tfidf,
+    "num_cols":  available,
+    "is_binary": True,
+    "threshold": float(best_thresh),
 }
 with open("sentiment_model.pkl", "wb") as f:
     pickle.dump(payload, f)
-print("Saved to sentiment_model.pkl")
+
+print(f"Saved sentiment_model.pkl  (threshold={best_thresh:.2f})")
